@@ -1,5 +1,9 @@
 #include <Arduino_GFX_Library.h>
-//#include <lvgl.h>
+#include <nrf52840.h>
+#include <nrfx_saadc.h>
+#include <AnalogIn.h>
+#include <pinDefinitions.h>
+
 
 #define GFX_BL 2
 
@@ -14,6 +18,7 @@ const char speed_unit[] = "km/h";
 const char distance_unit[] = "km";
 const float arc_span = 150.0;
 const float arc_start = - 180.0 + (180.0 - arc_span) / 2.0;
+const float battery_level_update_period = 5000; // in ms
 
 const String current_speed_value_format = "%d";
 
@@ -26,6 +31,9 @@ const char alltime_distance_format[] = "%05.0f km";
 const char alltime_duration_format[] = "%05d:%02d";
 const char alltime_avg_speed_format[] = "%4.1f";
 const char alltime_max_speed_format[] = "%4.1f";
+
+const char battery_voltage_format[] = "%5.3fV";
+const char battery_level_format[] = "%3d%%";
 
 const uint8_t current_speed_value_font_size = 10;
 const uint8_t current_speed_value_cursor_x_single = screenWidth / 2 - (hor_font_blocks / 2.0) * current_speed_value_font_size;
@@ -78,6 +86,14 @@ const uint8_t alltime_max_speed_font_size = 2;
 const uint8_t alltime_max_speed_cursor_x = alltime_avg_speed_cursor_x;
 const uint8_t alltime_max_speed_cursor_y = alltime_duration_cursor_y;
 
+const uint8_t battery_level_font_size = 2;
+const uint8_t battery_level_cursor_x = screenWidth / 2 - (2.0 * hor_font_blocks + 1.5) * battery_level_font_size;
+const uint8_t battery_level_cursor_y = screenHeight - (ver_font_blocks + 2.0) * battery_level_font_size;
+
+const uint8_t battery_voltage_font_size = 2;
+const uint8_t battery_voltage_cursor_x = screenWidth / 2 - (3.0 * hor_font_blocks + 2.5) * battery_voltage_font_size;
+const uint8_t battery_voltage_cursor_y = battery_level_cursor_y - (ver_font_blocks + 2.0) * battery_voltage_font_size;
+
 
 
 
@@ -129,9 +145,48 @@ char alltime_duration_string[8];
 char alltime_avg_speed_string[4];
 char alltime_max_speed_string[4];
 
+char battery_level_string[4];
+char battery_voltage_string[6];
+
+float battery_voltage;
+uint8_t battery_level;
 
 
 uint16_t interface_color = 0x07E0;
+
+// Battery Stuff
+class HackAnalogIn: public mbed::AnalogIn {
+  using mbed::AnalogIn::AnalogIn;
+  public:
+    analogin_t getAnalogIn_t();
+};
+
+analogin_t HackAnalogIn::getAnalogIn_t() {
+  return this->_adc;
+}
+
+void startReadingBatteryLevel (nrf_saadc_value_t* buffer) {
+  auto pin = PIN_VBAT;
+  PinName name = analogPinToPinName(pin);
+  if (name == NC) { return; }
+  HackAnalogIn* adc = static_cast<HackAnalogIn*>(analogPinToAdcObj(pin));
+  if (adc == NULL) {
+    adc = new HackAnalogIn(name);
+    analogPinToAdcObj(pin) = static_cast<mbed::AnalogIn*>(adc);
+#ifdef ANALOG_CONFIG
+    if (isAdcConfigChanged) {
+      adc->configure(adcCurrentConfig);
+    }
+#endif
+  }
+
+  nrfx_saadc_buffer_convert(buffer, 1);
+  nrfx_err_t ret = nrfx_saadc_sample();
+  if (ret == NRFX_ERROR_BUSY) {
+    // failed to start sampling
+    return;
+  }
+}
 
 
 void setup() {
@@ -145,8 +200,15 @@ void setup() {
   
   screenWidth = gfx->width();
   screenHeight = gfx->height();
+
+  // Battery Stuff
+  pinMode(P0_14, OUTPUT);
+  digitalWrite(P0_14,LOW);
+  pinMode(P0_13, OUTPUT);
+  digitalWrite(P0_13,LOW);
 }
 
+nrf_saadc_value_t BatteryLevel = { 0 };
 
 void loop() {
 
@@ -179,24 +241,26 @@ void loop() {
     }
   }
 
-  
-
-  /*Serial.print("Ddist: ");
-  Serial.print(current_distance - previous_distance);
-  Serial.print("Dduration: ");
-  Serial.println(current_duration - previous_duration);
-
-  Serial.print("Distance: ");
-  Serial.print(current_distance);
-  Serial.print("; Duration: ");
-  Serial.print(current_duration);
-  Serial.print("; Avg Speed: ");
-  Serial.println(current_avg_speed);*/
-
   if (current_speed_kmh <= speed_limit_kmh / 2) {
     interface_color = gfx->color565(255 * current_speed_kmh / (speed_limit_kmh / 2), 255, 0);
   } else {
     interface_color = gfx->color565(255, 255 - min(255 * (current_speed_kmh - (speed_limit_kmh / 2)) / (speed_limit_kmh / 2), 255), 0);
+  }
+
+  // Battery stuff
+  static unsigned long _lastT = 0;
+  unsigned long _t = millis();
+
+  if (_t - _lastT > battery_level_update_period) {
+    startReadingBatteryLevel(&BatteryLevel);
+    _lastT = _t;
+  }
+  
+  // check if ADC conversion has completed
+  if (nrf_saadc_event_check(NRF_SAADC_EVENT_DONE)) {
+    // ADC conversion completed. Reading is stored in BatteryLevel
+    nrf_saadc_event_clear(NRF_SAADC_EVENT_DONE);
+    battery_voltage = (float)BatteryLevel / 4095 * 3.3 / 510 * (1000 + 510);
   }
 
   draw_base();
@@ -209,6 +273,8 @@ void loop() {
   draw_alltime_avg_speed();
   draw_alltime_duration();
   draw_alltime_max_speed();
+  draw_battery_voltage();
+  draw_battery_level();
 
   gfx->flush();
 }
@@ -231,7 +297,6 @@ void draw_current_speed() {
 
   float arc_end = arc_start + min(arc_span * current_speed_kmh / speed_limit_kmh, arc_span);
   gfx->fillArc(screenWidth / 2, screenHeight / 2, screenWidth / 2, screenWidth / 2 - 24, arc_start, arc_end, interface_color);
-  
 }
 
 void draw_current_distance() {
@@ -245,7 +310,6 @@ void draw_current_distance() {
   }
   gfx->setTextSize(current_distance_font_size);
   gfx->print(current_distance_string);
-
 }
 
 void draw_current_duration() {
@@ -266,8 +330,6 @@ void draw_current_avg_speed() {
 
   gfx->setCursor(current_avg_speed_unit_cursor_x, current_avg_speed_unit_cursor_y);
   gfx->print(speed_unit);
-  
-  
 }
 
 void draw_current_max_speed() {
@@ -278,7 +340,6 @@ void draw_current_max_speed() {
 
   gfx->setCursor(current_max_speed_unit_cursor_x, current_max_speed_unit_cursor_y);
   gfx->print(speed_unit);
-  
 }
 
 void draw_alltime_distance() {
@@ -295,7 +356,6 @@ void draw_alltime_duration() {
   gfx->setCursor(alltime_duration_cursor_x, alltime_duration_cursor_y);
   gfx->setTextSize(alltime_duration_font_size);
   gfx->print(alltime_duration_string);
-  
 }
 
 void draw_alltime_avg_speed() {
@@ -303,7 +363,6 @@ void draw_alltime_avg_speed() {
   gfx->setCursor(alltime_avg_speed_cursor_x, alltime_avg_speed_cursor_y);
   gfx->setTextSize(alltime_avg_speed_font_size);
   gfx->print(alltime_avg_speed_string);
-  
 }
 
 void draw_alltime_max_speed() {
@@ -311,4 +370,19 @@ void draw_alltime_max_speed() {
   gfx->setCursor(alltime_max_speed_cursor_x, alltime_max_speed_cursor_y);
   gfx->setTextSize(alltime_max_speed_font_size);
   gfx->print(alltime_max_speed_string);
+}
+
+void draw_battery_level() {
+  battery_level = max(100.0 * (battery_voltage - 2.7) / 1.5, 0);
+  sprintf(battery_level_string, battery_level_format, battery_level);
+  gfx->setCursor(battery_level_cursor_x, battery_level_cursor_y);
+  gfx->setTextSize(battery_level_font_size);
+  gfx->print(battery_level_string);
+}
+
+void draw_battery_voltage() {
+  sprintf(battery_voltage_string, battery_voltage_format, battery_voltage);
+  gfx->setCursor(battery_voltage_cursor_x, battery_voltage_cursor_y);
+  gfx->setTextSize(battery_voltage_font_size);
+  gfx->print(battery_voltage_string);
 }
